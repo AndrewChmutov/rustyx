@@ -4,9 +4,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
+use reqwest::header::AUTHORIZATION;
+
 use serde::Deserialize;
-use serde_json::{self, Value};
+use serde_json::{self, Value, json};
 
 const CACHE_NAME: &str = "rustyx";
 const CONFIG_LOCATION: &str = "config.json";
@@ -17,7 +19,19 @@ struct Config {
     client_secret: String,
 }
 
-fn extract_value(value: &serde_json::Value) -> Option<String> {
+fn parse_response(response: &mut Response) -> Result<Value, String> {
+    let mut buf = "".to_string();
+    if let Err(error) = response.read_to_string(&mut buf) {
+        return Err(error.to_string());
+    };
+
+    return match serde_json::from_str(&buf) {
+        Ok(parsed) => parsed,
+        Err(error) => return Err(format!("Could not parse json: {error}")),
+    };
+}
+
+fn extract_value(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
         _ => None,
@@ -71,15 +85,7 @@ fn tokens_from_params(params: &HashMap<&str, String>) -> Result<(String, Option<
         Err(err) => return Err(format!("Could not get the response: {err}")),
     };
 
-    let mut buf = "".to_string();
-    if let Err(error) = response.read_to_string(&mut buf) {
-        return Err(error.to_string());
-    };
-
-    let parsed: Value = match serde_json::from_str(&buf) {
-        Ok(parsed) => parsed,
-        Err(error) => return Err(format!("Could not parse json: {error}")),
-    };
+    let parsed = parse_response(&mut response)?;
 
     match (
         parsed.get("access_token").and_then(extract_value),
@@ -125,6 +131,39 @@ fn authorize_by_refresh_token(
     tokens_from_params(&params)
 }
 
+struct RemoteFile {
+    path: String,
+    content_hash: String
+}
+
+impl RemoteFile {
+    fn from_remote_folder(access_token: &str, folder: &str) -> Result<Vec<Self>, String> {
+        let response = match Client::new()
+            .post("https://api.dropboxapi.com/2/files/list_folder")
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
+            .json(&json!({
+                "recursive": true,
+                "path": "/onyx/Go103/Notepads",
+            }))
+            .send()
+            .and_then(|x| x.error_for_status())
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(format!("Could not get the response during listing: {error}"))
+            }
+        };
+
+        let parsed = parse_response(&mut response)?;
+
+        parsed.get("access_token").and_then(extract_value),
+        parsed.get("refresh_token").and_then(extract_value),
+        ) {
+            (Some(access_token), refresh_token) => Ok((access_token.to_string(), refresh_token)),
+            _ => Err("Could not get tokens from the request".to_string()),
+        }
+}
+
 fn main() {
     let config = match fs::read_to_string(CONFIG_LOCATION)
         .map_err(|_| ())
@@ -161,5 +200,6 @@ fn main() {
         };
     }
 
-    println!("Access token {access_token}");
+    println!("response {response:?}");
+    println!("body {:?}", response.text_with_charset("utf-8").unwrap());
 }
